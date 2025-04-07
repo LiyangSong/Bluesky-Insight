@@ -1,1 +1,1 @@
-# Threads Insight
+# Bluesky Insight
