@@ -14,16 +14,6 @@ gen
 .history/
 *.vsix
 
-### Django template
-*.log
-*.pot
-*.pyc
-__pycache__/
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
-media
-
 ### Windows template
 # Windows thumbnail cache files
 Thumbs.db
@@ -132,3 +122,6 @@ dmypy.json
 .pyre/
 .pytype/
 cython_debug/
+
+# temp storage
+temp_storage/
