@@ -1,19 +1,25 @@
-import asyncio
 import json
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 
+import nltk
 from bloom_filter import BloomFilter
 
 import websockets
 from dotenv import load_dotenv
+from nltk import word_tokenize
+from nltk.corpus import stopwords
 
 
 class JetstreamProcessor:
     def __init__(self):
         load_dotenv()
         self.jetstream_wss = os.getenv('JETSTREAM_WSS')
+
+        nltk.download('punkt_tab')
+        nltk.download('stopwords')
 
         # Use Bloom Filter to reduce memory usage
         self.seen_posts = BloomFilter(
@@ -84,18 +90,31 @@ class JetstreamProcessor:
         self.seen_posts.add(cid)
 
         text = data["commit"]["record"]["text"]
+        preprocessed_text = self._preprocess_text(text)
         created_at = data["commit"]["record"]["createdAt"]
 
         #  Temp storage
         self.temp_storage.append({
             "cid": cid,
             "created_at": created_at,
-            "text": text
+            "text": preprocessed_text
         })
 
         # Persist storage periodically
         if time.time() - self.last_saved_time > self.persist_interval:
             await self.persist_storage()
+
+    @staticmethod
+    def _preprocess_text(text):
+        preprocessed_text = re.sub(r'http\S+', '', text)  # Remove URL
+        preprocessed_text = re.sub(r'@\w+', '', preprocessed_text)  # Remove @
+        preprocessed_text = preprocessed_text.lower()
+        preprocessed_text = re.sub(r'[^\w\s]', '', preprocessed_text)  # Remove punctuation
+        # Remove Stop words
+        tokens = word_tokenize(preprocessed_text)
+        stops = set(stopwords.words("english"))
+        tokens = [t for t in tokens if t not in stops]
+        return ' '.join(tokens)
 
     async def persist_storage(self):
         # Persist data from temp storage
@@ -109,7 +128,7 @@ class JetstreamProcessor:
                 for post in self.temp_storage:
                     f.write(json.dumps(post) + "\n")
 
-            print(f"Saved {len(self.temp_storage)} data to {filename}")
+            print(f"Saved {len(self.temp_storage)} posts to {filename}")
 
             # Reset temp storage
             self.temp_storage = []
@@ -118,12 +137,3 @@ class JetstreamProcessor:
         except IOError as e:
             print(f"Failed to persist temp storage: {e}")
 
-
-if __name__ == '__main__':
-    jetstream_processor = JetstreamProcessor()
-    os.makedirs("temp_storage", exist_ok=True)
-    try:
-        asyncio.run(jetstream_processor.process_jetstream())
-    except KeyboardInterrupt:
-        print("Received keyboard interrupt. Persisting temp storage...")
-        asyncio.run(jetstream_processor.persist_storage())
