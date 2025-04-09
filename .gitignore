@@ -125,3 +125,4 @@ cython_debug/
 
 # temp storage
 temp_storage/
+output/
