@@ -5,16 +5,19 @@ import time
 from contextlib import asynccontextmanager
 
 import nltk
+import pyarrow as pa
+from pyarrow import parquet as pq
 from bloom_filter import BloomFilter
 
 import websockets
 from dotenv import load_dotenv
-from nltk import word_tokenize
+from nltk import word_tokenize, PorterStemmer
 from nltk.corpus import stopwords
+from tqdm.asyncio import tqdm
 
 
 class JetstreamProcessor:
-    def __init__(self):
+    def __init__(self, queue):
         load_dotenv()
         self.jetstream_wss = os.getenv('JETSTREAM_WSS')
 
@@ -29,12 +32,16 @@ class JetstreamProcessor:
 
         self.temp_storage = []
 
+        # Queue service that stores post temp storage files
+        self.queue = queue
+
         # Periodically persist data from temp storage
         self.persist_interval = 300  # 5 minutes
         self.last_saved_time = time.time()
 
     @asynccontextmanager
     async def _auto_managed_connection(self):
+        """Connect to Jetstream websocket that supports auto retries."""
         retry_count = 0
         max_retries = 5
 
@@ -46,26 +53,32 @@ class JetstreamProcessor:
                     ping_timeout=60,
                     max_queue=1024
                 ) as ws:
-                    print("Connected to Jetstream WS")
+                    print("[JetstreamProcessor] Connected to Jetstream WS")
                     retry_count = 0
                     yield ws
             except (websockets.ConnectionClosed, OSError) as e:
                 if retry_count > max_retries:
-                    raise RuntimeError(f"Failed to connect to Jetstream WS exceeding max retry times: {e}")
-                print(f"Connection closed. Retrying...")
+                    raise RuntimeError(f"[JetstreamProcessor] Failed to connect to Jetstream WS exceeding max retry times: {e}")
+                print(f"[JetstreamProcessor] Connection closed. Retrying...")
                 retry_count += 1
 
     async def process_jetstream(self):
+        """Read post message from Jetstream websocket and process it."""
         async with self._auto_managed_connection() as ws:
             await ws.send(json.dumps({
                 "wantedCollections": ["app.bsky.feed.post"]
             }))
 
             try:
+                # Progress bar for streaming posts
+                self.tqdm_bar = tqdm(desc="[JetstreamProcessor] Processing post messages from Jetstream WS:",
+                                 bar_format='{desc} {n_fmt} posts [{elapsed}<{remaining}, {rate_fmt}{postfix}]',
+                                 unit="posts", dynamic_ncols=True, leave=False)
+
                 async for message in ws:
                     await self._process_post(message)
             except websockets.exceptions.ConnectionClosed as e:
-                print(f"Connection Closed: {e}")
+                print(f"[JetstreamProcessor] Connection Closed: {e}")
             finally:
                 await self.persist_storage()
 
@@ -90,50 +103,84 @@ class JetstreamProcessor:
         self.seen_posts.add(cid)
 
         text = data["commit"]["record"]["text"]
-        preprocessed_text = self._preprocess_text(text)
-        created_at = data["commit"]["record"]["createdAt"]
 
         #  Temp storage
         self.temp_storage.append({
             "cid": cid,
-            "created_at": created_at,
-            "text": preprocessed_text
+            "text_raw": text,
+            "text_for_trend": self._preprocess_text_for_trend(text),
+            "text_for_sentiment": self._preprocess_text_for_sentiment(text),
+            "timestamp": data["commit"]["record"]["createdAt"]
         })
+
+        # Update progress bar
+        self.tqdm_bar.update(1)
 
         # Persist storage periodically
         if time.time() - self.last_saved_time > self.persist_interval:
+            tqdm.write('')
             await self.persist_storage()
 
     @staticmethod
-    def _preprocess_text(text):
-        preprocessed_text = re.sub(r'http\S+', '', text)  # Remove URL
-        preprocessed_text = re.sub(r'@\w+', '', preprocessed_text)  # Remove @
+    def _preprocess_text_for_trend(text):
+        """Preprocess text for trending analysis. Apply multiple preprocessing steps to keep only keywords."""
+        # Remove URL and @
+        preprocessed_text = re.sub(r'http\S+|@\w+', '', text)
+
         preprocessed_text = preprocessed_text.lower()
-        preprocessed_text = re.sub(r'[^\w\s]', '', preprocessed_text)  # Remove punctuation
+
+        # Remove punctuation
+        preprocessed_text = re.sub(r'[^\w\s]', '', preprocessed_text)
+
         # Remove Stop words
         tokens = word_tokenize(preprocessed_text)
         stops = set(stopwords.words("english"))
         tokens = [t for t in tokens if t not in stops]
+
+        # Stem words
+        stemmer = PorterStemmer()
+        tokens = [stemmer.stem(t) for t in tokens]
+
         return ' '.join(tokens)
+
+    @staticmethod
+    def _preprocess_text_for_sentiment(text):
+        """Preprocess text for sentiment analysis. Only apply simple preprocessing to keep original meanings."""
+        # Replace URL and @ with labels
+        preprocessed_text = re.sub(r'http\S+', '[URL]', text)
+        preprocessed_text = re.sub(r'@\w+', '[MENTION]', preprocessed_text)
+
+        # Keep basic punctuations
+        preprocessed_text = re.sub(r"[^a-zA-Z0-9\s!?.,']", '', preprocessed_text)
+
+        return preprocessed_text
 
     async def persist_storage(self):
         # Persist data from temp storage
         if not self.temp_storage:
             return
 
-        filename = f"jetstream_{int(time.time())}.json"
+        filename = f"jetstream_{int(time.time())}.parquet"
 
         try:
-            with open(f"temp_storage/{filename}", 'w') as f:
-                for post in self.temp_storage:
-                    f.write(json.dumps(post) + "\n")
+            table = pa.Table.from_pydict({
+                "cid": pa.array([post["cid"] for post in self.temp_storage]),
+                "text_raw": pa.array([post["text_raw"] for post in self.temp_storage]),
+                "text_for_trend": pa.array([post["text_for_trend"] for post in self.temp_storage]),
+                "text_for_sentiment": pa.array([post["text_for_sentiment"] for post in self.temp_storage]),
+                "timestamp": pa.array([post["timestamp"] for post in self.temp_storage])
+            })
+            pq.write_table(table, f"temp_storage/{filename}")
 
-            print(f"Saved {len(self.temp_storage)} posts to {filename}")
+            # Add file to queue
+            await self.queue.enqueue(filename)
+
+            print(f"[JetstreamProcessor] Saved {len(self.temp_storage)} posts to {filename}")
 
             # Reset temp storage
             self.temp_storage = []
             self.last_saved_time = time.time()
 
         except IOError as e:
-            print(f"Failed to persist temp storage: {e}")
+            print(f"[JetstreamProcessor] Failed to persist temp storage: {e}")
 
