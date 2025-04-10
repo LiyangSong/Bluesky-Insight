@@ -11,8 +11,8 @@ from bloom_filter import BloomFilter
 
 import websockets
 from dotenv import load_dotenv
-from nltk import word_tokenize, PorterStemmer
-from nltk.corpus import stopwords
+from nltk import WordNetLemmatizer, pos_tag, TweetTokenizer
+from nltk.corpus import stopwords, wordnet
 from tqdm.asyncio import tqdm
 
 
@@ -21,12 +21,19 @@ class JetstreamProcessor:
         load_dotenv()
         self.jetstream_wss = os.getenv('JETSTREAM_WSS')
 
+        # Download NLTK resources
         nltk.download('punkt_tab')
         nltk.download('stopwords')
+        nltk.download('wordnet')
+        nltk.download('averaged_perceptron_tagger_eng')
+
+        # Custom more stopwords
+        with open('assets/custom_stopwords.txt') as f:
+            self.custom_stopwords = set(line.strip() for line in f if line.strip())
 
         # Use Bloom Filter to reduce memory usage
         self.seen_posts = BloomFilter(
-            max_elements=100_000,
+            max_elements=1_000_000,
             error_rate=0.001
         )
 
@@ -36,7 +43,7 @@ class JetstreamProcessor:
         self.queue = queue
 
         # Periodically persist data from temp storage
-        self.persist_interval = 300  # 5 minutes
+        self.persist_interval = int(os.getenv('PERSIST_INTERVAL'))
         self.last_saved_time = time.time()
 
     @asynccontextmanager
@@ -121,37 +128,61 @@ class JetstreamProcessor:
             tqdm.write('')
             await self.persist_storage()
 
-    @staticmethod
-    def _preprocess_text_for_trend(text):
+    def _preprocess_text_for_trend(self, text):
         """Preprocess text for trending analysis. Apply multiple preprocessing steps to keep only keywords."""
-        # Remove URL and @
-        preprocessed_text = re.sub(r'http\S+|@\w+', '', text)
+        # Remove URL
+        preprocessed_text = re.sub(r'(https?:\/\/)?(www\.)?[-a-zA-Z0-9@:%._\+~#=]{2,256}\.([a-z]{2,6})?\b([-a-zA-Z0-9@:%_\+.~#?&\/\/=]*)', '', text)
 
-        preprocessed_text = preprocessed_text.lower()
+        # Remove @
+        preprocessed_text = re.sub(r'@[\w.-]+', '', preprocessed_text)
 
-        # Remove punctuation
-        preprocessed_text = re.sub(r'[^\w\s]', '', preprocessed_text)
+        # Tokenize text
+        tokenizer = TweetTokenizer(preserve_case=False, reduce_len=True)
+        tokens = tokenizer.tokenize(preprocessed_text)
 
         # Remove Stop words
-        tokens = word_tokenize(preprocessed_text)
         stops = set(stopwords.words("english"))
+        stops.update(self.custom_stopwords)
         tokens = [t for t in tokens if t not in stops]
 
-        # Stem words
-        stemmer = PorterStemmer()
-        tokens = [stemmer.stem(t) for t in tokens]
+        # Remove punctuation
+        tokens = [re.sub(r"[^\w\s]", '', t) for t in tokens]
+        tokens = [t for t in tokens if t]  # Remove empty strings
+
+        # Lemmatize words with POS tagging
+        lemmatizer = WordNetLemmatizer()
+        tagged_tokens = pos_tag(tokens)
+        tokens = [lemmatizer.lemmatize(token, pos=self._get_wordnet_pos(tag)) for token, tag in tagged_tokens]
+
+        # Remove stopwords again to handle lemmatized words, remove numeric words
+        tokens = [t for t in tokens if t not in stops and not t.isnumeric()]
 
         return ' '.join(tokens)
 
     @staticmethod
+    def _get_wordnet_pos(tag):
+        """Function to map NLTK's POS tags to the format used by the WordNet lemmatizer."""
+        if tag.startswith('J'):
+            return wordnet.ADJ
+        elif tag.startswith('V'):
+            return wordnet.VERB
+        elif tag.startswith('R'):
+            return wordnet.ADV
+        else:
+            # Default to noun if no match is found or starts with 'N'
+            return wordnet.NOUN
+
+    @staticmethod
     def _preprocess_text_for_sentiment(text):
         """Preprocess text for sentiment analysis. Only apply simple preprocessing to keep original meanings."""
-        # Replace URL and @ with labels
-        preprocessed_text = re.sub(r'http\S+', '[URL]', text)
-        preprocessed_text = re.sub(r'@\w+', '[MENTION]', preprocessed_text)
+        # Remove URL
+        preprocessed_text = re.sub(r'(https?:\/\/)?(www\.)?[-a-zA-Z0-9@:%._\+~#=]{2,256}\.([a-z]{2,6})?\b([-a-zA-Z0-9@:%_\+.~#?&\/\/=]*)', '', text)
+
+        # Remove @
+        preprocessed_text = re.sub(r'@[\w.-]+', '', preprocessed_text)
 
         # Keep basic punctuations
-        preprocessed_text = re.sub(r"[^a-zA-Z0-9\s!?.,']", '', preprocessed_text)
+        preprocessed_text = re.sub(r"[^a-zA-Z0-9\s!?.,'’]", '', preprocessed_text)
 
         return preprocessed_text
 
