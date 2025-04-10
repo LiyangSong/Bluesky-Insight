@@ -34,7 +34,17 @@ class SentimentAnalyzer:
 
         self.tokenizer = AutoTokenizer.from_pretrained(os.getenv("SENTIMENT_MODEL"))
         self.model = AutoModelForSequenceClassification.from_pretrained(os.getenv("SENTIMENT_MODEL"))
+        if self.device == 'cuda':
+            self.model = self.model.half()  # FP16
+            self.model = torch.compile(self.model)  # Optimize with TorchDynamo
+
         self.executor = ThreadPoolExecutor(max_workers=4)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        self.executor.shutdown(wait=True)
 
     async def parallel_analyze(self, trend_posts):
         futures = [

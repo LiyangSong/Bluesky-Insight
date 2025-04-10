@@ -2,7 +2,6 @@ import asyncio
 import os
 
 from apps.worker.jetstream_processor import JetstreamProcessor
-from apps.worker.sentiment_analyzer import SentimentAnalyzer
 from apps.worker.trend_analyzer import TrendAnalyzer
 
 
@@ -23,8 +22,7 @@ async def main():
 
     queue = StreamAnalysisQueue()
     jetstream_processor = JetstreamProcessor(queue)
-    sentiment_analyzer = SentimentAnalyzer()
-    trend_analyzer = TrendAnalyzer(queue, sentiment_analyzer)
+    trend_analyzer = TrendAnalyzer(queue)
 
     await asyncio.gather(
         jetstream_processor.process_jetstream(),
